@@ -14,12 +14,17 @@
 # under the License.
 
 import oslo_messaging as messaging
+import os
 from oslo_service import periodic_task
 
 from cyborg.accelerator.drivers.fpga.base import FPGADriver
 from cyborg.agent.resource_tracker import ResourceTracker
 from cyborg.conductor import rpcapi as cond_api
 from cyborg.conf import CONF
+from cyborg.client.image import glance
+from cyborg.client.image import util as img_util
+from cyborg.client.placement import placement
+from cyborg.client.token import token
 
 
 class AgentManager(periodic_task.PeriodicTasks):
@@ -43,11 +48,33 @@ class AgentManager(periodic_task.PeriodicTasks):
         """List installed hardware."""
         pass
 
-    def fpga_program(self, context, accelerator, image):
+    def get_image_id(self, context, resource_type, requires):
+        # (TODO) should sync images
+        self._rt._update_image_info()
+        return img_util.get_image_uuid_by_match_requirement(
+            self._rt.images, resource_type, requires)
+
+    def fpga_program(self, context, accelerator, image_id):
         """ Program a FPGA regoin, image can be a url or local file"""
         # TODO (Shaohe Feng) Get image from glance.
         # And add claim and rollback logical.
-        raise NotImplementedError()
+        # glance.download_fpga_image(tok, image_id, url)
+        tok, data = token.get_token()
+        url = token.get_image_url(tok)
+        # (TODO) if md5 files exist, and checksum is right, no need to download again
+        glance.download_fpga_image(tok, image_id, url,
+                                   filepath=img_util.FGPA_IMGAGE_PATH)
+        md5 = self._rt.images["images"][image_id]["checksum"]
+        if not img_util.download_image_check(image_id, md5, path=img_util.FGPA_IMGAGE_PATH):
+            return False
+        vendor = self._rt.images["images"][image_id]["vendor"]
+        dr = FPGADriver.create(vendor.lower())
+        # program VF
+        dr.program(accelerator,
+                   os.path.join(img_util.FGPA_IMGAGE_PATH, image_id))
+
+        return True
+        # raise NotImplementedError()
 
     @periodic_task.periodic_task(run_immediately=True)
     def update_available_resource(self, context, startup=True):

@@ -24,7 +24,7 @@ import os
 import re
 
 
-SYS_FPGA = "/sys/class/fpga"
+SYS_FPGA = "/tmp/sys/class/fpga"
 DEVICE = "device"
 PF = "physfn"
 VF = "virtfn*"

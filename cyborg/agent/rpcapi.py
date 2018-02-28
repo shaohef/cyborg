@@ -50,3 +50,15 @@ class AgentAPI(object):
     def hardware_list(self, context, values):
         """Signal the agent to find local hardware."""
         pass
+
+    def get_image_id(self, context, resource_type, requires, host=CONF.host):
+        cctxt = self.client.prepare(topic=self.topic, server=host)
+        kw = {'resource_type': resource_type, 'requires': requires}
+        return cctxt.call(context, 'get_image_id', **kw)
+
+    def fpga_program(self, context, accelerator, image_id, host=CONF.host):
+        #We can get host from FPGA Deployables.node_id
+        kw = {'accelerator': accelerator, 'image_id': image_id}
+
+        cctxt = self.client.prepare(topic=self.topic, server=host)
+        return cctxt.call(context, 'fpga_program', **kw)

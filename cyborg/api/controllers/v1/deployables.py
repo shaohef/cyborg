@@ -17,6 +17,7 @@ import pecan
 from pecan import rest
 from six.moves import http_client
 import wsme
+from pecan import expose as pexpose
 from wsme import types as wtypes
 
 from cyborg.api.controllers import base
@@ -26,7 +27,9 @@ from cyborg.api.controllers.v1 import utils as api_utils
 from cyborg.api import expose
 from cyborg.common import exception
 from cyborg.common import policy
+from cyborg.client.image import util as img_util
 from cyborg import objects
+from cyborg.agent.rpcapi import AgentAPI
 
 
 class Deployable(base.APIBase):
@@ -121,9 +124,150 @@ class DeployablePatchType(types.JsonPatchType):
         defaults = types.JsonPatchType.internal_attrs()
         return defaults + ['/pcie_address', '/host', '/type']
 
+class Allocation(base.APIBase):
+    """API representation of a deployable Allocation.
+
+    This class enforces type checking and value constraints, and converts
+    between the internal object model and the API representation of
+    a deployable allocation.
+    """
+
+    uuid = types.uuid
+    """The UUID of the deployable"""
+
+    name = wtypes.text
+    """The name of the deployable"""
+
+    pcie_address = wtypes.text
+    """The pcie address of the deployable"""
+
+    host = wtypes.text
+    """The host on which the deployable is located"""
+
+    type = wtypes.text
+    """The type of the deployable"""
+
+    instance_uuid = types.uuid
+    """The UUID of the instance which deployable is assigned to"""
+
+    links = wsme.wsattr([link.Link], readonly=True)
+    """A list containing a self link"""
+
+    def __init__(self, **kwargs):
+        super(Allocation, self).__init__(**kwargs)
+        self.fields = []
+        for field in objects.Deployable.fields:
+            if hasattr(self, k) and getattr(self, k) != wsme.Unset:
+                self.fields.append(field)
+            setattr(self, field, kwargs.get(field, wtypes.Unset))
+
+    @classmethod
+    def convert_with_links(cls, obj_dep):
+        api_dep = cls(**obj_dep.as_dict())
+        url = pecan.request.public_url
+        api_dep.links = [
+            link.Link.make_link('self', url, 'deployables', api_dep.uuid),
+            link.Link.make_link('bookmark', url, 'deployables', api_dep.uuid,
+                                bookmark=True)
+            ]
+        return api_dep
+
+
+class AllocationCollection(base.APIBase):
+    """API representation of a collection of deployables."""
+
+    allocations = [Allocation]
+    """A list containing deployable objects"""
+
+    @classmethod
+    def convert_with_links(cls, obj_deps):
+        collection = cls()
+        collection.allocations = [Allocation.convert_with_links(obj_dep)
+                                  for obj_dep in obj_deps]
+        return collection
+
+class AllocationsController(rest.RestController):
+    """REST controller for Deployables Action."""
+
+    agentapi = AgentAPI()
+
+    @expose.expose(DeployableCollection, body=types.jsontype)
+    def post(self, dep):
+        context = pecan.request.context
+        instance_uuid = dep.get("instance_uuid")
+        host = dep.get("host")
+        if not instance_uuid or not host:
+            # FIXME (Should raise exception)
+            return DeployableCollection.convert_with_links([])
+        # FIXME should use filter (such as host, and instance_uuid) for list.
+        obj_deps = objects.Deployable.list(pecan.request.context)
+        resources = [v for k, v in dep.items() if k.startswith("resource")]
+        resources_map = {}
+        for res in resources:
+            if res.count("_") < 3 or "=" not in res:
+                continue
+            rule, num = res.rsplit("=", 1)
+            num = int(num)
+            fpga, vendor, typ = rule.split("_")[1:4]
+            vendor_res = resources_map.setdefault(vendor, {"PF": 0, "VF": 0})
+            if typ == "PF":
+                vendor_res["PF"] = vendor_res["PF"] + num
+            if typ == "VF":
+                vendor_res["VF"] = vendor_res["VF"] + num
+        dep_reqs = dep.get("require", [])
+        requires = []
+        for r in dep_reqs:
+            if r.count("_") < 2:
+                continue
+            requires.append(r.split("_", 2)[2:][-1])
+
+        for vendor, res in resources_map.items():
+            for obj in obj_deps:
+                # (FIXME) we can check whether the fpga is programed already.
+                obj_vendor = img_util.vendor_id_to_name(obj["vendor"])
+                if (obj["instance_uuid"] or not obj["assignable"] or
+                    obj_vendor != vendor or obj["host"] != host):
+                    continue
+                pf_objs = res.setdefault("pf_devices", [])
+                pf = res.get("PF")
+                if obj["type"] == "pf" and len(pf_objs) < pf:
+                    pf_objs.append(obj)
+
+                vf_objs = res.setdefault("vf_devices", [])
+                vf = res.get("VF")
+                if obj["type"] == "vf" and len(vf_objs) < vf:
+                    vf_objs.append(obj)
+                if len(pf_objs) == pf and len(vf_objs) == vf:
+                    break
+
+        obj_deps = []
+        for vendor, res in resources_map.items():
+            if res.get("PF", 0) > len(res.get("pf_devices", [])):
+                return DeployableCollection.convert_with_links([])
+            if res.get("VF", 0) > len(res.get("vf_devices", [])):
+                return DeployableCollection.convert_with_links([])
+            obj_deps = obj_deps + res.get("pf_devices", []) + res.get("vf_devices", [])
+
+        for vendor, res in resources_map.items():
+            for obj in res.get("vf_devices"):
+                uuid = self.agentapi.get_image_id(
+                    context, "CUSTOM_FPGA_%s_VF" % vendor, requires,
+                    obj["host"])
+                if not uuid:
+                    return DeployableCollection.convert_with_links([])
+                self.agentapi.fpga_program(
+                    context, obj["pcie_address"], uuid, obj["host"])
+
+        for obj in obj_deps:
+            obj["instance_uuid"] = instance_uuid
+            new_dep = pecan.request.conductor_api.deployable_update(context, obj)
+
+        return DeployableCollection.convert_with_links(obj_deps)
 
 class DeployablesController(rest.RestController):
     """REST controller for Deployables."""
+
+    allocations = AllocationsController()
 
     @policy.authorize_wsgi("cyborg:deployable", "create", False)
     @expose.expose(Deployable, body=types.jsontype,
@@ -133,6 +277,7 @@ class DeployablesController(rest.RestController):
 
         :param dep: a deployable within the request body.
         """
+        import pdb; pdb.set_trace()
         context = pecan.request.context
         obj_dep = objects.Deployable(context, **dep)
         new_dep = pecan.request.conductor_api.deployable_create(context,
@@ -203,3 +348,27 @@ class DeployablesController(rest.RestController):
         context = pecan.request.context
         obj_dep = objects.Deployable.get(context, uuid)
         pecan.request.conductor_api.deployable_delete(context, obj_dep)
+
+    # @pexpose()
+    # @pexpose(method='POST')
+    # def action(self):
+    #     print pecan.request
+    #     return dict()
+
+    # # @action.when(method='POST')
+    # def claim(self, q):
+    #     import pdb; pdb.set_trace()
+    #     return  {"hello": "world"}
+
+    # @pexpose(generic=True)
+    # def _lookup(self, action, *remainder):
+    #     return {}
+
+    # @pexpose()
+    # def _default(self):
+    #     if action == "action" and pecan.request.method == "POST":
+    #         return {}
+
+    # @pexpose()
+    # def _route(self, *remainder):
+    #     return  {"hello": "world"}
