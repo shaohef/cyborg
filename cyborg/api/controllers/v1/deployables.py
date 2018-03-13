@@ -201,32 +201,39 @@ class AllocationsController(rest.RestController):
             return DeployableCollection.convert_with_links([])
         # FIXME should use filter (such as host, and instance_uuid) for list.
         obj_deps = objects.Deployable.list(pecan.request.context)
-        resources = [v for k, v in dep.items() if k.startswith("resource")]
+        resources = [(k.split(":", 1)[0].split("resources", 1)[-1],
+                      k.split(":", 1)[-1], v)
+                     for k, v in dep.items() if k.startswith("resources")]
         resources_map = {}
-        for res in resources:
-            if res.count("_") < 3 or "=" not in res:
+        for gid, rule, v in resources:
+            if rule.count("_") < 3:
                 continue
-            rule, num = res.rsplit("=", 1)
-            num = int(num)
+            num = int(v)
             fpga, vendor, typ = rule.split("_")[1:4]
-            vendor_res = resources_map.setdefault(vendor, {"PF": 0, "VF": 0})
+            vendor_res = resources_map.setdefault("_".join((vendor, gid)), {"PF": 0, "VF": 0})
             if typ == "PF":
                 vendor_res["PF"] = vendor_res["PF"] + num
             if typ == "VF":
                 vendor_res["VF"] = vendor_res["VF"] + num
-        dep_reqs = dep.get("require", [])
-        requires = []
-        for r in dep_reqs:
-            if r.count("_") < 2:
+
+        dep_reqs = [(k.split(":", 1)[0].split("trait", 1)[-1],
+                     k.split(":", 1)[-1], v)
+                    for k, v in dep.items() if k.startswith("trait")]
+
+        requires = {}
+        # ignore val = required
+        for gid, name, val in dep_reqs:
+            if name.count("_") < 2:
                 continue
-            requires.append(r.split("_", 2)[2:][-1])
+            g = requires.setdefault(gid, [])
+            g.append(name.split("_", 2)[2:][-1])
 
         for vendor, res in resources_map.items():
             for obj in obj_deps:
                 # (FIXME) we can check whether the fpga is programed already.
                 obj_vendor = img_util.vendor_id_to_name(obj["vendor"])
                 if (obj["instance_uuid"] or not obj["assignable"] or
-                    obj_vendor != vendor or obj["host"] != host):
+                    obj_vendor != vendor.split("_", 1)[0] or obj["host"] != host):
                     continue
                 pf_objs = res.setdefault("pf_devices", [])
                 pf = res.get("PF")
@@ -249,9 +256,11 @@ class AllocationsController(rest.RestController):
             obj_deps = obj_deps + res.get("pf_devices", []) + res.get("vf_devices", [])
 
         for vendor, res in resources_map.items():
+            gid = vendor.split("_", 1)[-1]
             for obj in res.get("vf_devices"):
                 uuid = self.agentapi.get_image_id(
-                    context, "CUSTOM_FPGA_%s_VF" % vendor, requires,
+                    context, "CUSTOM_FPGA_%s_VF" % vendor.split("_", 1)[0],
+                    requires.get(gid, []),
                     obj["host"])
                 if not uuid:
                     return DeployableCollection.convert_with_links([])
