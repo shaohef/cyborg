@@ -29,7 +29,7 @@ from cyborg.objects.driver_objects import driver_deployable, driver_device,\
     driver_attach_handle, driver_controlpath_id, driver_attribute
 from cyborg.common import constants
 
-SYS_FPGA = "/tmp/sys/class/fpga"
+SYS_FPGA = "/sys/class/fpga"
 DEVICE = "device"
 PF = "physfn"
 VF = "virtfn*"
